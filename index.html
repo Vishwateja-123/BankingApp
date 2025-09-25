@@ -1,0 +1,566 @@
+import React, { useMemo, useRef, useState } from "react";
+
+// ==========================
+// Core Domain Models (OO)
+// ==========================
+
+// ---------- Observer Pattern ----------
+// Subject (Account) maintains a list of observers (Customers)
+class AccountSubject {
+  constructor(name, initialBalance = 0) {
+    this.name = name;
+    this._balance = initialBalance;
+    this._observers = new Set();
+  }
+
+  get balance() {
+    return this._balance;
+  }
+
+  attach(observer) {
+    this._observers.add(observer);
+  }
+
+  detach(observer) {
+    this._observers.delete(observer);
+  }
+
+  notify(event) {
+    this._observers.forEach((obs) => obs.update && obs.update({ ...event }));
+  }
+
+  deposit(amount, meta = {}) {
+    if (amount <= 0 || !Number.isFinite(amount)) return;
+    this._balance += amount;
+    this.notify({
+      type: "deposit",
+      account: this.name,
+      amount,
+      balance: this._balance,
+      ...meta,
+    });
+  }
+
+  withdraw(amount, meta = {}) {
+    if (amount <= 0 || !Number.isFinite(amount)) return;
+    if (amount > this._balance) throw new Error("Insufficient funds");
+    this._balance -= amount;
+    this.notify({
+      type: "withdraw",
+      account: this.name,
+      amount,
+      balance: this._balance,
+      ...meta,
+    });
+  }
+}
+
+// Observer – a minimal Customer that records notifications
+class CustomerObserver {
+  constructor(name) {
+    this.name = name;
+    this.messages = [];
+  }
+
+  update(evt) {
+    const timestamp = new Date().toLocaleTimeString();
+    const verb = evt.type === "deposit" ? "deposited" : evt.type === "withdraw" ? "withdrew" : evt.type;
+    this.messages.unshift(
+      `[${timestamp}] ${this.name} notified: ${verb} $${evt.amount.toFixed(2)} in ${evt.account}. New balance: $${evt.balance.toFixed(2)}`
+    );
+  }
+}
+
+// ---------- Strategy Pattern ----------
+// Interest strategies share the same interface: compute(principal, annualRate, years)
+class SavingsInterestStrategy {
+  name = "Savings (Compound Monthly)";
+  // Compound interest monthly
+  compute(P, annualRatePct, years) {
+    const r = annualRatePct / 100;
+    const n = 12; // monthly compounding
+    return P * Math.pow(1 + r / n, n * years) - P;
+  }
+}
+
+class FixedDepositInterestStrategy {
+  name = "Fixed Deposit (Compound Quarterly)";
+  compute(P, annualRatePct, years) {
+    const r = annualRatePct / 100;
+    const n = 4; // quarterly compounding
+    return P * Math.pow(1 + r / n, n * years) - P;
+  }
+}
+
+class CurrentAccountInterestStrategy {
+  name = "Current (Simple Interest)";
+  compute(P, annualRatePct, years) {
+    const r = annualRatePct / 100;
+    return P * r * years; // simple interest
+  }
+}
+
+// Context that uses a pluggable strategy
+class InterestContext {
+  constructor(strategy) {
+    this.strategy = strategy;
+  }
+  setStrategy(strategy) {
+    this.strategy = strategy;
+  }
+  computeInterest(P, rate, years) {
+    if (!this.strategy) throw new Error("Strategy not set");
+    return this.strategy.compute(P, rate, years);
+  }
+}
+
+// ---------- Command Pattern ----------
+// Command interface: execute(), undo(), label
+class DepositCommand {
+  constructor(account, amount) {
+    this.account = account;
+    this.amount = amount;
+    this.label = `Deposit $${amount}`;
+  }
+  execute() {
+    this.account.deposit(this.amount, { via: "Command" });
+  }
+  undo() {
+    this.account.withdraw(this.amount, { via: "Undo" });
+  }
+}
+
+class WithdrawCommand {
+  constructor(account, amount) {
+    this.account = account;
+    this.amount = amount;
+    this.label = `Withdraw $${amount}`;
+  }
+  execute() {
+    this.account.withdraw(this.amount, { via: "Command" });
+  }
+  undo() {
+    this.account.deposit(this.amount, { via: "Undo" });
+  }
+}
+
+class TransferCommand {
+  constructor(fromAccount, toAccount, amount) {
+    this.from = fromAccount;
+    this.to = toAccount;
+    this.amount = amount;
+    this.label = `Transfer $${amount} (${fromAccount.name} → ${toAccount.name})`;
+  }
+  execute() {
+    this.from.withdraw(this.amount, { via: "Transfer→" + this.to.name });
+    this.to.deposit(this.amount, { via: "Transfer←" + this.from.name });
+  }
+  undo() {
+    // reverse the transfer
+    this.to.withdraw(this.amount, { via: "UndoTransfer→" + this.from.name });
+    this.from.deposit(this.amount, { via: "UndoTransfer←" + this.to.name });
+  }
+}
+
+class CommandManager {
+  constructor() {
+    this.history = [];
+  }
+  executeCommand(cmd) {
+    cmd.execute();
+    this.history.push(cmd);
+  }
+  undo() {
+    const cmd = this.history.pop();
+    if (cmd) cmd.undo();
+    return cmd;
+  }
+  clear() {
+    this.history = [];
+  }
+}
+
+// ==========================
+// UI Pages
+// ==========================
+
+function Section({ title, children, subtitle }) {
+  return (
+    <div className="rounded-2xl shadow p-6 bg-white border border-slate-200">
+      <h2 className="text-xl font-bold mb-1">{title}</h2>
+      {subtitle && <p className="text-sm text-slate-600 mb-4">{subtitle}</p>}
+      {children}
+    </div>
+  );
+}
+
+function Stat({ label, value }) {
+  return (
+    <div className="flex flex-col items-start p-3 rounded-xl bg-slate-50 border border-slate-200">
+      <span className="text-xs uppercase tracking-wide text-slate-500">{label}</span>
+      <span className="text-lg font-semibold">{value}</span>
+    </div>
+  );
+}
+
+// ---------- Observer Page ----------
+function ObserverPage() {
+  const [amount, setAmount] = useState(50);
+
+  // create account + customer observer
+  const { account, customer } = useMemo(() => {
+    const acc = new AccountSubject("Primary", 500);
+    const cust = new CustomerObserver("Customer A");
+    acc.attach(cust);
+    return { account: acc, customer: cust };
+  }, []);
+
+  const [, setTick] = useState(0); // force re-render when balance changes
+
+  const safeAction = (fn) => {
+    try {
+      fn();
+      setTick((t) => t + 1);
+    } catch (e) {
+      alert(e.message);
+    }
+  };
+
+  return (
+    <div className="grid md:grid-cols-2 gap-6">
+      <Section
+        title="Observer Pattern"
+        subtitle="Account (Subject) notifies Customers (Observers) on deposits/withdrawals."
+      >
+        <div className="grid grid-cols-2 gap-4 mb-6">
+          <Stat label="Account" value={account.name} />
+          <Stat label="Balance" value={`$${account.balance.toFixed(2)}`} />
+        </div>
+        <div className="flex items-center gap-3 mb-3">
+          <input
+            className="border rounded px-3 py-2 w-40"
+            type="number"
+            value={amount}
+            onChange={(e) => setAmount(Number(e.target.value))}
+          />
+          <button
+            className="px-3 py-2 rounded-xl bg-emerald-600 text-white hover:opacity-90"
+            onClick={() => safeAction(() => account.deposit(amount))}
+          >
+            Deposit
+          </button>
+          <button
+            className="px-3 py-2 rounded-xl bg-rose-600 text-white hover:opacity-90"
+            onClick={() => safeAction(() => account.withdraw(amount))}
+          >
+            Withdraw
+          </button>
+        </div>
+        <p className="text-sm text-slate-600">
+          Try depositing/withdrawing and watch the notifications appear automatically.
+        </p>
+      </Section>
+      <Section title="Notifications (Observer Updates)">
+        <div className="h-72 overflow-auto rounded-xl border border-slate-200 p-3 bg-slate-50">
+          {customer.messages.length === 0 ? (
+            <p className="text-slate-500">No notifications yet.</p>
+          ) : (
+            <ul className="space-y-2">
+              {customer.messages.map((m, i) => (
+                <li key={i} className="text-sm font-mono">{m}</li>
+              ))}
+            </ul>
+          )}
+        </div>
+      </Section>
+    </div>
+  );
+}
+
+// ---------- Strategy Page ----------
+function StrategyPage() {
+  const strategies = useMemo(
+    () => ({
+      savings: new SavingsInterestStrategy(),
+      fd: new FixedDepositInterestStrategy(),
+      current: new CurrentAccountInterestStrategy(),
+    }),
+    []
+  );
+
+  const [selected, setSelected] = useState("savings");
+  const [P, setP] = useState(1000);
+  const [rate, setRate] = useState(6.5); // annual %
+  const [years, setYears] = useState(1);
+
+  const ctx = useMemo(() => new InterestContext(strategies[selected]), [selected, strategies]);
+
+  const interest = useMemo(() => {
+    try {
+      return ctx.computeInterest(Number(P), Number(rate), Number(years));
+    } catch (e) {
+      return 0;
+    }
+  }, [P, rate, years, ctx]);
+
+  const total = Number(P) + interest;
+
+  return (
+    <div className="grid md:grid-cols-2 gap-6">
+      <Section
+        title="Strategy Pattern"
+        subtitle="Swap interest-calculation algorithms at runtime without changing calling code."
+      >
+        <div className="flex gap-2 flex-wrap mb-4">
+          <button
+            className={`px-3 py-2 rounded-xl border ${selected === "savings" ? "bg-slate-900 text-white" : "bg-white"}`}
+            onClick={() => setSelected("savings")}
+          >
+            Savings (Compound Monthly)
+          </button>
+          <button
+            className={`px-3 py-2 rounded-xl border ${selected === "fd" ? "bg-slate-900 text-white" : "bg-white"}`}
+            onClick={() => setSelected("fd")}
+          >
+            Fixed Deposit (Quarterly)
+          </button>
+          <button
+            className={`px-3 py-2 rounded-xl border ${selected === "current" ? "bg-slate-900 text-white" : "bg-white"}`}
+            onClick={() => setSelected("current")}
+          >
+            Current (Simple)
+          </button>
+        </div>
+        <div className="grid grid-cols-3 gap-3 mb-4">
+          <label className="flex flex-col text-sm">
+            <span className="text-slate-600 mb-1">Principal ($)</span>
+            <input className="border rounded px-3 py-2" type="number" value={P} onChange={(e) => setP(e.target.value)} />
+          </label>
+          <label className="flex flex-col text-sm">
+            <span className="text-slate-600 mb-1">Rate (% p.a.)</span>
+            <input className="border rounded px-3 py-2" type="number" value={rate} onChange={(e) => setRate(e.target.value)} />
+          </label>
+          <label className="flex flex-col text-sm">
+            <span className="text-slate-600 mb-1">Years</span>
+            <input className="border rounded px-3 py-2" type="number" value={years} onChange={(e) => setYears(e.target.value)} />
+          </label>
+        </div>
+        <p className="text-sm text-slate-600">Change strategies to see different interest outcomes using the same inputs.</p>
+      </Section>
+      <Section title="Results">
+        <div className="grid grid-cols-2 gap-4">
+          <Stat label="Strategy" value={strategies[selected].name} />
+          <Stat label="Principal" value={`$${Number(P).toFixed(2)}`} />
+          <Stat label="Interest" value={`$${interest.toFixed(2)}`} />
+          <Stat label="Total Value" value={`$${total.toFixed(2)}`} />
+        </div>
+      </Section>
+    </div>
+  );
+}
+
+// ---------- Command Page ----------
+function CommandPage() {
+  const [amount, setAmount] = useState(100);
+  const [from, setFrom] = useState("A");
+  const [to, setTo] = useState("B");
+
+  const { accounts, manager } = useMemo(() => {
+    const A = new AccountSubject("A", 500);
+    const B = new AccountSubject("B", 300);
+    const C = new AccountSubject("C", 200);
+
+    // Optional: attach a silent observer for consistency/logging (not shown)
+    const manager = new CommandManager();
+    return { accounts: { A, B, C }, manager };
+  }, []);
+
+  const [, setTick] = useState(0);
+  const rerender = () => setTick((t) => t + 1);
+
+  const exec = (cmd) => {
+    try {
+      manager.executeCommand(cmd);
+      rerender();
+    } catch (e) {
+      alert(e.message);
+    }
+  };
+
+  const undo = () => {
+    const undone = manager.undo();
+    if (!undone) alert("Nothing to undo");
+    rerender();
+  };
+
+  const accList = Object.values(accounts);
+  const getAcc = (name) => accounts[name];
+
+  return (
+    <div className="grid md:grid-cols-2 gap-6">
+      <Section
+        title="Command Pattern"
+        subtitle="Encapsulate banking operations (deposit, withdraw, transfer) as Commands with undo support."
+      >
+        <div className="grid grid-cols-3 gap-4 mb-4">
+          {accList.map((acc) => (
+            <Stat key={acc.name} label={`Account ${acc.name}`} value={`$${acc.balance.toFixed(2)}`} />
+          ))}
+        </div>
+
+        <div className="flex flex-wrap items-end gap-3">
+          <label className="flex flex-col text-sm">
+            <span className="text-slate-600 mb-1">Amount ($)</span>
+            <input className="border rounded px-3 py-2 w-36" type="number" value={amount} onChange={(e) => setAmount(Number(e.target.value))} />
+          </label>
+
+          <button
+            className="px-3 py-2 rounded-xl bg-emerald-600 text-white hover:opacity-90"
+            onClick={() => exec(new DepositCommand(getAcc(from), amount))}
+          >
+            Deposit → A (toggle below)
+          </button>
+          <button
+            className="px-3 py-2 rounded-xl bg-rose-600 text-white hover:opacity-90"
+            onClick={() => exec(new WithdrawCommand(getAcc(from), amount))}
+          >
+            Withdraw ← A (toggle below)
+          </button>
+
+          <div className="w-full h-2" />
+
+          <div className="flex items-center gap-2">
+            <label className="text-sm">From</label>
+            <select className="border rounded px-2 py-2" value={from} onChange={(e) => setFrom(e.target.value)}>
+              <option>A</option>
+              <option>B</option>
+              <option>C</option>
+            </select>
+            <label className="text-sm ml-2">To</label>
+            <select className="border rounded px-2 py-2" value={to} onChange={(e) => setTo(e.target.value)}>
+              <option>A</option>
+              <option>B</option>
+              <option>C</option>
+            </select>
+            <button
+              className="px-3 py-2 rounded-xl bg-slate-900 text-white hover:opacity-90"
+              onClick={() => exec(new TransferCommand(getAcc(from), getAcc(to), amount))}
+            >
+              Transfer
+            </button>
+            <button className="px-3 py-2 rounded-xl border" onClick={undo}>
+              Undo Last
+            </button>
+          </div>
+          <p className="text-xs text-slate-500">Tip: Choose different From/To accounts, then Transfer. Use Undo to revert.</p>
+        </div>
+      </Section>
+
+      <Section title="History (Undo-able Commands)">
+        <HistoryList manager={manager} />
+      </Section>
+    </div>
+  );
+}
+
+function HistoryList({ manager }) {
+  const [, setTick] = useState(0);
+  const listRef = useRef(null);
+  const force = () => setTick((t) => t + 1);
+
+  // Auto-scroll to top when history changes
+  React.useEffect(() => {
+    force();
+    if (listRef.current) listRef.current.scrollTop = 0;
+  }, [manager.history.length]);
+
+  return (
+    <div ref={listRef} className="h-72 overflow-auto rounded-xl border border-slate-200 p-3 bg-slate-50">
+      {manager.history.length === 0 ? (
+        <p className="text-slate-500">No commands executed yet.</p>
+      ) : (
+        <ol className="list-decimal pl-5 space-y-2">
+          {manager.history
+            .slice()
+            .reverse()
+            .map((cmd, i) => (
+              <li key={i} className="text-sm">{cmd.label}</li>
+            ))}
+        </ol>
+      )}
+    </div>
+  );
+}
+
+// ==========================
+// Shell + Routing
+// ==========================
+
+const PAGES = [
+  { id: "observer", title: "Observer" },
+  { id: "strategy", title: "Strategy" },
+  { id: "command", title: "Command" },
+];
+
+export default function App() {
+  const [page, setPage] = useState("observer");
+
+  let content = null;
+  if (page === "observer") content = <ObserverPage />;
+  if (page === "strategy") content = <StrategyPage />;
+  if (page === "command") content = <CommandPage />;
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-slate-50 to-slate-100 text-slate-900">
+      <header className="sticky top-0 z-20 backdrop-blur supports-[backdrop-filter]:bg-white/70 bg-white/90 border-b">
+        <div className="max-w-6xl mx-auto px-4 py-3 flex items-center justify-between">
+          <h1 className="text-xl font-bold">Banking Patterns Demo</h1>
+          <nav className="flex gap-2">
+            {PAGES.map((p) => (
+              <button
+                key={p.id}
+                onClick={() => setPage(p.id)}
+                className={`px-3 py-2 rounded-xl border transition ${
+                  page === p.id ? "bg-slate-900 text-white" : "bg-white hover:bg-slate-50"
+                }`}
+                aria-current={page === p.id ? "page" : undefined}
+              >
+                {p.title}
+              </button>
+            ))}
+          </nav>
+        </div>
+      </header>
+
+      <main className="max-w-6xl mx-auto p-4 space-y-6">
+        <Intro />
+        {content}
+      </main>
+
+      <footer className="max-w-6xl mx-auto px-4 py-8 text-center text-xs text-slate-500">
+        Built with OO concepts + behavioral patterns (Observer, Strategy, Command).
+      </footer>
+    </div>
+  );
+}
+
+function Intro() {
+  return (
+    <Section title="How this site is organized" subtitle="Each page demonstrates one behavioral design pattern in a banking context.">
+      <ul className="grid md:grid-cols-3 gap-3 text-sm">
+        <li className="p-3 rounded-xl border bg-white">
+          <p className="font-semibold mb-1">Observer</p>
+          <p>Account (Subject) keeps a list of Customers (Observers) and notifies them whenever balance changes.</p>
+        </li>
+        <li className="p-3 rounded-xl border bg-white">
+          <p className="font-semibold mb-1">Strategy</p>
+          <p>Swap interest algorithms at runtime: Savings (monthly compound), Fixed Deposit (quarterly), Current (simple).</p>
+        </li>
+        <li className="p-3 rounded-xl border bg-white">
+          <p className="font-semibold mb-1">Command</p>
+          <p>Encapsulate operations (deposit/withdraw/transfer) as commands supporting undo through a history stack.</p>
+        </li>
+      </ul>
+    </Section>
+  );
+}
